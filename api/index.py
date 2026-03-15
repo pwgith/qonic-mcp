@@ -46,11 +46,21 @@ mcp = FastMCP(
         "Use the available tools to interact with Qonic resources such as projects, "
         "models, products (building elements), spatial locations, materials, types, "
         "codifications, and custom properties.\n\n"
-        "Workflow for modifying a model:\n"
+        "KEY CONCEPTS:\n"
+        "- Projects contain models. Use list_projects and list_models to discover them.\n"
+        "- Models are created by uploading an IFC file: get_upload_url → upload file to "
+        "that URL → create_model. Models cannot be created empty.\n"
+        "- Type libraries are part of models. Use list_types to find existing library GUIDs. "
+        "There is no 'create type library' endpoint — type libraries come from models.\n"
+        "- Products are building elements (walls, doors, slabs, etc.) inside a model.\n\n"
+        "WORKFLOW FOR MODIFYING A MODEL:\n"
         "1. Call start_modification_session before making changes\n"
         "2. Use modify_products / delete_product to make changes\n"
         "3. Call publish_changes to save, or discard_changes to revert\n"
-        "4. Call end_modification_session when done"
+        "4. Call end_modification_session when done\n\n"
+        "ASYNC OPERATIONS:\n"
+        "calculate_quantities and start_export_ifc return an operation ID. "
+        "Poll get_operation until the status is complete, then retrieve the result URL."
     ),
 )
 
@@ -109,6 +119,49 @@ def list_models(
 ) -> str:
     """List all models within a Qonic project. Returns model IDs, names, and edit permissions."""
     result = _api_request("GET", f"/projects/{project_id}/models")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_upload_url() -> str:
+    """Get a pre-signed upload URL for uploading an IFC file. Use this before create_model."""
+    result = _api_request("GET", "/upload-url")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def create_model(
+    project_id: str = Field(description="Project ID to create the model in"),
+    model_name: str = Field(description="Name for the new model"),
+    upload_url: str = Field(description="The upload URL returned by get_upload_url after uploading an IFC file"),
+    upload_file_name: str = Field(description="Original file name of the uploaded IFC file"),
+    discipline: str = Field(description="Model discipline, e.g. 'Architecture', 'Structural', 'MEP'"),
+    default_role: str = Field(default="", description="Default role for the model (optional)"),
+) -> str:
+    """Create a new model from an uploaded IFC file. Workflow: 1) get_upload_url, 2) upload IFC to that URL, 3) call this."""
+    body: dict[str, Any] = {
+        "modelName": model_name,
+        "uploadUrl": upload_url,
+        "uploadFileName": upload_file_name,
+        "discipline": discipline,
+    }
+    if default_role:
+        body["defaultRole"] = default_role
+    result = _api_request("POST", f"/projects/{project_id}/models", body=body)
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tools – Async Operations
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_operation(
+    operation_id: str = Field(description="Operation ID to check status of"),
+) -> str:
+    """Check the status of an async operation (e.g. quantity calculation or IFC export)."""
+    result = _api_request("GET", f"/operations/{operation_id}")
     return json.dumps(result, indent=2)
 
 
@@ -246,6 +299,45 @@ def discard_changes(
     result = _api_request(
         "POST",
         f"/projects/{project_id}/models/{model_id}/discard",
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def calculate_quantities(
+    project_id: str = Field(description="Project ID"),
+    model_id: str = Field(description="Model ID"),
+    calculators: str = Field(
+        description='JSON array of calculator names, e.g. ["BaseQuantities"]'
+    ),
+    filters: str = Field(
+        default="[]",
+        description='JSON array of filter objects (same format as query_products), or [] for all products',
+    ),
+) -> str:
+    """Start an async quantity calculation. Returns an operation ID — use get_operation to poll for results."""
+    body: dict[str, Any] = {
+        "calculators": json.loads(calculators),
+        "filters": json.loads(filters) or {},
+    }
+    result = _api_request(
+        "POST",
+        f"/projects/{project_id}/models/{model_id}/products/quantities/query",
+        body=body,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def start_export_ifc(
+    project_id: str = Field(description="Project ID"),
+    model_id: str = Field(description="Model ID to export"),
+) -> str:
+    """Start an async IFC export. Returns an operation ID — use get_operation to poll for completion."""
+    result = _api_request(
+        "POST",
+        f"/projects/{project_id}/models/{model_id}/export-ifc",
         allow_empty=True,
     )
     return json.dumps(result, indent=2)
@@ -423,6 +515,18 @@ def delete_material(
     return json.dumps(result, indent=2)
 
 
+@mcp.tool()
+def delete_material_library(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the material library to delete"),
+) -> str:
+    """Permanently delete a material library from a project."""
+    result = _api_request(
+        "DELETE", f"/projects/{project_id}/material-libraries/{library_guid}", allow_empty=True
+    )
+    return json.dumps(result, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Tools – Types
 # ---------------------------------------------------------------------------
@@ -544,6 +648,69 @@ def create_classification_code(
     return json.dumps(result, indent=2)
 
 
+@mcp.tool()
+def get_codification_library(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the codification library"),
+) -> str:
+    """Get details of a specific codification library."""
+    result = _api_request("GET", f"/projects/{project_id}/codifications/{library_guid}")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def delete_codification_library(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the codification library to delete"),
+) -> str:
+    """Permanently delete a codification library from a project."""
+    result = _api_request(
+        "DELETE", f"/projects/{project_id}/codifications/{library_guid}", allow_empty=True
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def update_classification_code(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the codification library"),
+    codification_guid: str = Field(description="GUID of the classification code to update"),
+    name: str = Field(default="", description="New name"),
+    identification: str = Field(default="", description="New identification string"),
+    description: str = Field(default="", description="New description"),
+) -> str:
+    """Update a classification code in a codification library."""
+    body: dict[str, Any] = {}
+    if name:
+        body["name"] = name
+    if identification:
+        body["identification"] = identification
+    if description:
+        body["description"] = description
+    result = _api_request(
+        "PUT",
+        f"/projects/{project_id}/codifications/{library_guid}/codification/{codification_guid}",
+        body=body,
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def delete_classification_code(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the codification library"),
+    codification_guid: str = Field(description="GUID of the classification code to delete"),
+) -> str:
+    """Permanently delete a classification code from a codification library."""
+    result = _api_request(
+        "DELETE",
+        f"/projects/{project_id}/codifications/{library_guid}/codification/{codification_guid}",
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Tools – Custom Properties
 # ---------------------------------------------------------------------------
@@ -600,6 +767,89 @@ def add_property_definition(
         "POST",
         f"/projects/{project_id}/customProperties/property-sets/{property_set_id}/property",
         body=body,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def update_property_set(
+    project_id: str = Field(description="Project ID"),
+    property_set_id: str = Field(description="ID of the property set to update"),
+    name: str = Field(default="", description="New name for the property set"),
+    entity_types: str = Field(
+        default="",
+        description='JSON array of entity type objects (leave empty to keep current)',
+    ),
+) -> str:
+    """Update a custom property set."""
+    body: dict[str, Any] = {}
+    if name:
+        body["name"] = name
+    if entity_types:
+        body["entityTypes"] = json.loads(entity_types)
+    result = _api_request(
+        "PUT",
+        f"/projects/{project_id}/customProperties/property-sets/{property_set_id}",
+        body=body,
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def delete_property_set(
+    project_id: str = Field(description="Project ID"),
+    property_set_id: str = Field(description="ID of the property set to delete"),
+) -> str:
+    """Permanently delete a custom property set."""
+    result = _api_request(
+        "DELETE",
+        f"/projects/{project_id}/customProperties/property-sets/{property_set_id}",
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def update_property_definition(
+    project_id: str = Field(description="Project ID"),
+    property_set_id: str = Field(description="ID of the property set"),
+    property_definition_id: str = Field(description="ID of the property definition to update"),
+    name: str = Field(default="", description="New name"),
+    data_type: str = Field(default="", description="New data type"),
+    measure_type: str = Field(default="", description="New measure type"),
+    unit: str = Field(default="", description="New unit"),
+) -> str:
+    """Update a property definition in a custom property set."""
+    body: dict[str, Any] = {}
+    if name:
+        body["name"] = name
+    if data_type:
+        body["dataType"] = data_type
+    if measure_type:
+        body["measureType"] = measure_type
+    if unit:
+        body["unit"] = unit
+    result = _api_request(
+        "PUT",
+        f"/projects/{project_id}/customProperties/property-sets/{property_set_id}/property/{property_definition_id}",
+        body=body,
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def delete_property_definition(
+    project_id: str = Field(description="Project ID"),
+    property_set_id: str = Field(description="ID of the property set"),
+    property_definition_id: str = Field(description="ID of the property definition to delete"),
+) -> str:
+    """Permanently delete a property definition from a custom property set."""
+    result = _api_request(
+        "DELETE",
+        f"/projects/{project_id}/customProperties/property-sets/{property_set_id}/property/{property_definition_id}",
+        allow_empty=True,
     )
     return json.dumps(result, indent=2)
 
