@@ -48,8 +48,10 @@ mcp = FastMCP(
         "codifications, and custom properties.\n\n"
         "KEY CONCEPTS:\n"
         "- Projects contain models. Use list_projects and list_models to discover them.\n"
-        "- Models are created by uploading an IFC file: get_upload_url → upload file to "
-        "that URL → create_model. Models cannot be created empty.\n"
+        "- To create a model: call upload_ifc with base64-encoded IFC content and a filename, "
+        "then call create_model with the returned upload_url. The upload_ifc tool handles "
+        "getting a signed URL and uploading the file to S3 for you.\n"
+        "- You CAN generate IFC file content yourself and pass it as base64 to upload_ifc.\n"
         "- Type libraries are part of models. Use list_types to find existing library GUIDs. "
         "There is no 'create type library' endpoint — type libraries come from models.\n"
         "- Products are building elements (walls, doors, slabs, etc.) inside a model.\n\n"
@@ -124,9 +126,66 @@ def list_models(
 
 @mcp.tool()
 def get_upload_url() -> str:
-    """Get a pre-signed upload URL for uploading an IFC file. Use this before create_model."""
+    """Get a pre-signed upload URL for uploading an IFC file. Low-level tool — prefer upload_ifc instead."""
     result = _api_request("GET", "/upload-url")
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def upload_ifc(
+    ifc_content_base64: str = Field(
+        description=(
+            "Base64-encoded IFC file content. Generate a valid IFC file "
+            "(IFC2X3 or IFC4) and encode it to base64."
+        )
+    ),
+    file_name: str = Field(
+        default="model.ifc",
+        description="File name for the IFC file (e.g. 'my_house.ifc')",
+    ),
+) -> str:
+    """Upload an IFC file to Qonic's storage. Returns the upload_url and file_name needed for create_model.
+
+    This handles the full upload flow:
+    1. Gets a pre-signed S3 upload URL from Qonic
+    2. Decodes the base64 IFC content
+    3. Uploads the file to S3
+    4. Returns {upload_url, file_name} to pass to create_model
+    """
+    token = _access_token.get()
+    if not token:
+        raise ValueError("Not authenticated.")
+
+    # Step 1: Get signed upload URL from Qonic
+    upload_data = _api_request("GET", "/upload-url")
+    signed_url = upload_data["uploadUrl"]
+
+    # Step 2: Decode the IFC content
+    try:
+        ifc_bytes = base64.b64decode(ifc_content_base64)
+    except Exception as e:
+        return json.dumps({"error": f"Invalid base64 content: {e}"})
+
+    # Step 3: Upload to S3
+    with httpx.Client(timeout=60) as client:
+        upload_resp = client.put(
+            signed_url,
+            content=ifc_bytes,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        if upload_resp.status_code >= 400:
+            return json.dumps({
+                "error": f"S3 upload failed with status {upload_resp.status_code}",
+                "detail": upload_resp.text[:500],
+            })
+
+    # Step 4: Return info for create_model
+    return json.dumps({
+        "upload_url": signed_url,
+        "file_name": file_name,
+        "size_bytes": len(ifc_bytes),
+        "instructions": "Now call create_model with this upload_url and file_name.",
+    }, indent=2)
 
 
 @mcp.tool()
