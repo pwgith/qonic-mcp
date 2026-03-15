@@ -273,6 +273,7 @@ def search(
 
 # Use FastMCP's built-in Streamable HTTP app (includes lifespan management)
 mcp.settings.stateless_http = True
+mcp.settings.streamable_http_path = "/mcp"
 
 _inner_app = mcp.streamable_http_app()
 
@@ -322,6 +323,14 @@ async def app(scope, receive, send):
         auth = request.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
             _access_token.set(auth[7:])
+
+        # Ensure ASGI scope has a proper server tuple for Starlette's host
+        # validation (Vercel's runtime may not set this correctly)
+        if not scope.get("server"):
+            host = request.headers.get("host", "localhost")
+            hostname = host.split(":")[0]
+            port = int(host.split(":")[1]) if ":" in host else (443 if scope.get("scheme") == "https" else 80)
+            scope = dict(scope, server=(hostname, port))
 
     # Delegate everything else to the MCP app
     await _inner_app(scope, receive, send)
