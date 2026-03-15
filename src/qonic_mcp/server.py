@@ -5,25 +5,16 @@ A Model Context Protocol server that exposes Qonic API capabilities as MCP tools
 Hosted on Vercel with OAuth authentication via Qonic.
 """
 
-import contextlib
 import contextvars
 import json
 import os
-from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.server import StreamableHTTPASGIApp
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from pydantic import Field
-from starlette.applications import Starlette
-from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
+from starlette.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
 # Per-request OAuth token (extracted from Authorization header)
@@ -273,94 +264,63 @@ def search(
 
 
 # ---------------------------------------------------------------------------
-# OAuth Authorization Server Metadata (RFC 8414 / MCP auth spec)
+# ASGI application
 # ---------------------------------------------------------------------------
 
-async def _oauth_metadata(request: Request) -> JSONResponse:
-    """Return OAuth metadata so MCP clients know where to authenticate."""
-    base = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "")
-    if base and not base.startswith("http"):
-        base = f"https://{base}"
-    if not base:
-        base = str(request.base_url).rstrip("/")
+# Use FastMCP's built-in Streamable HTTP app (includes lifespan management)
+mcp.settings.stateless_http = True
 
-    metadata: dict[str, Any] = {
-        "issuer": base,
-        "authorization_endpoint": os.environ.get(
-            "QONIC_OAUTH_AUTHORIZE_URL",
-            f"{BASE_URL}/v1/auth/authorize",
-        ),
-        "token_endpoint": os.environ.get(
-            "QONIC_OAUTH_TOKEN_URL",
-            f"{BASE_URL}/v1/auth/token",
-        ),
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
-        "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post"],
-        "scopes_supported": [
-            "projects:read", "projects:write",
-            "models:read", "models:write",
-            "issues:read",
-            "libraries:read", "libraries:write",
-        ],
-    }
-
-    if OAUTH_CLIENT_ID:
-        metadata["client_id"] = OAUTH_CLIENT_ID
-
-    return JSONResponse(metadata)
+_inner_app = mcp.streamable_http_app()
 
 
-# ---------------------------------------------------------------------------
-# Auth middleware – extract Bearer token for each request
-# ---------------------------------------------------------------------------
+async def app(scope, receive, send):
+    """ASGI wrapper that adds OAuth metadata + token extraction."""
+    if scope["type"] == "http":
+        request = Request(scope, receive, send)
 
-class _AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
+        # Serve OAuth metadata
+        if request.url.path == "/.well-known/oauth-authorization-server":
+            base = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "")
+            if base and not base.startswith("http"):
+                base = f"https://{base}"
+            if not base:
+                base = str(request.base_url).rstrip("/")
+
+            metadata: dict[str, Any] = {
+                "issuer": base,
+                "authorization_endpoint": os.environ.get(
+                    "QONIC_OAUTH_AUTHORIZE_URL",
+                    f"{BASE_URL}/v1/auth/authorize",
+                ),
+                "token_endpoint": os.environ.get(
+                    "QONIC_OAUTH_TOKEN_URL",
+                    f"{BASE_URL}/v1/auth/token",
+                ),
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": ["client_secret_post"],
+                "scopes_supported": [
+                    "projects:read", "projects:write",
+                    "models:read", "models:write",
+                    "issues:read",
+                    "libraries:read", "libraries:write",
+                ],
+            }
+            if OAUTH_CLIENT_ID:
+                metadata["client_id"] = OAUTH_CLIENT_ID
+
+            response = JSONResponse(metadata)
+            await response(scope, receive, send)
+            return
+
+        # Extract Bearer token for API calls
         auth = request.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
             _access_token.set(auth[7:])
-        return await call_next(request)
 
-
-# ---------------------------------------------------------------------------
-# ASGI application (Streamable HTTP transport for Vercel serverless)
-# ---------------------------------------------------------------------------
-
-_session_manager = StreamableHTTPSessionManager(
-    app=mcp._mcp_server,
-    stateless=True,
-)
-
-_http_handler = StreamableHTTPASGIApp(_session_manager)
-
-
-@contextlib.asynccontextmanager
-async def _lifespan(app: Starlette) -> AsyncIterator[None]:
-    async with _session_manager.run():
-        yield
-
-
-app = Starlette(
-    routes=[
-        Route(
-            "/.well-known/oauth-authorization-server",
-            _oauth_metadata,
-        ),
-        Route("/mcp", endpoint=_http_handler, methods=["GET", "POST", "DELETE"]),
-    ],
-    middleware=[
-        Middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-            allow_headers=["*"],
-        ),
-        Middleware(_AuthMiddleware),
-    ],
-    lifespan=_lifespan,
-)
+    # Delegate everything else to the MCP app
+    await _inner_app(scope, receive, send)
 
 
 # ---------------------------------------------------------------------------
