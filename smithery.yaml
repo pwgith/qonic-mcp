@@ -1,0 +1,27 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    title: Qonic MCP Configuration
+    description: Configuration for the Qonic MCP server
+    properties:
+      apiKey:
+        type: string
+        title: API Key
+        description: Your Qonic API key for authentication
+      baseUrl:
+        type: string
+        title: Base URL
+        description: Qonic API base URL (defaults to https://api.qonic.com)
+        default: "https://api.qonic.com"
+    required:
+      - apiKey
+  commandFunction: |-
+    (config) => ({
+      command: "python",
+      args: ["-m", "qonic_mcp.server"],
+      env: {
+        QONIC_API_KEY: config.apiKey,
+        QONIC_BASE_URL: config.baseUrl ?? "https://api.qonic.com",
+      },
+    })
