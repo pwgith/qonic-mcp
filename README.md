@@ -1,8 +1,10 @@
 # qonic-mcp
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for
-[Qonic](https://qonic.com), written in Python and deployable on
-[Smithery](https://smithery.ai).
+[Qonic](https://qonic.com), written in Python and deployed on
+[Vercel](https://vercel.com).
+
+Users authenticate with their Qonic account via OAuth — no API keys needed.
 
 ## Features
 
@@ -27,7 +29,6 @@ The server exposes the following MCP tools:
 ### Prerequisites
 
 - Python 3.11+
-- A Qonic API key
 
 ### Local development
 
@@ -40,38 +41,34 @@ cd qonic-mcp
 pip install uv
 uv pip install -e .
 
-# Configure your API key
-cp .env.example .env
-# Edit .env and set QONIC_API_KEY
-
-# Run the server
+# Run the server locally (starts on port 8000)
 python -m qonic_mcp.server
 ```
 
-### Running with Docker
+## Deploying to Vercel
 
-```bash
-docker build -t qonic-mcp .
-docker run -e QONIC_API_KEY=your-key qonic-mcp
-```
+1. Push this repo to GitHub.
+2. Import the repo in the [Vercel dashboard](https://vercel.com/new).
+3. Set the required environment variables (see below).
+4. Deploy — Vercel will use `vercel.json` and `requirements.txt` automatically.
 
-## Deploying to Smithery
+The MCP endpoint will be available at:
+`https://<your-project>.vercel.app/mcp`
 
-This server is configured for deployment on [Smithery](https://smithery.ai) via
-`smithery.yaml`. When deploying, provide the following configuration:
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `apiKey` | ✅ | Your Qonic API key |
-| `baseUrl` | ❌ | Qonic API base URL (default: `https://api.qonic.com`) |
+OAuth metadata is served at:
+`https://<your-project>.vercel.app/.well-known/oauth-authorization-server`
 
 ## Environment variables
 
+Set these in the Vercel dashboard under **Settings → Environment Variables**.
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `QONIC_API_KEY` | ✅ | — | Qonic API key |
 | `QONIC_BASE_URL` | ❌ | `https://api.qonic.com` | Qonic API base URL |
 | `QONIC_TIMEOUT` | ❌ | `30` | Request timeout in seconds |
+| `QONIC_OAUTH_AUTHORIZE_URL` | ❌ | `{BASE_URL}/oauth/authorize` | Qonic OAuth authorization endpoint |
+| `QONIC_OAUTH_TOKEN_URL` | ❌ | `{BASE_URL}/oauth/token` | Qonic OAuth token endpoint |
+| `QONIC_OAUTH_REGISTRATION_URL` | ❌ | — | Dynamic client registration endpoint (if supported) |
 
 ## License
 

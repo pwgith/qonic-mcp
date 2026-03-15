@@ -2,42 +2,44 @@
 Qonic MCP Server
 
 A Model Context Protocol server that exposes Qonic API capabilities as MCP tools.
-Designed to be hosted on Smithery.
+Hosted on Vercel with OAuth authentication via Qonic.
 """
 
+import contextlib
+import contextvars
 import json
+import os
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import StreamableHTTPASGIApp
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
+# ---------------------------------------------------------------------------
+# Per-request OAuth token (extracted from Authorization header)
+# ---------------------------------------------------------------------------
+
+_access_token: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "access_token", default=None
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-class Settings(BaseSettings):
-    """Server configuration loaded from environment variables."""
-
-    model_config = SettingsConfigDict(env_prefix="QONIC_", env_file=".env")
-
-    api_key: str = Field(
-        default="",
-        description="Qonic API key for authentication",
-    )
-    base_url: str = Field(
-        default="https://api.qonic.com",
-        description="Base URL for the Qonic API",
-    )
-    timeout: int = Field(
-        default=30,
-        description="Request timeout in seconds",
-    )
-
-
-settings = Settings()
+BASE_URL = os.environ.get("QONIC_BASE_URL", "https://api.qonic.com")
+TIMEOUT = int(os.environ.get("QONIC_TIMEOUT", "30"))
+OAUTH_CLIENT_ID = os.environ.get("QONIC_OAUTH_CLIENT_ID", "")
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -57,29 +59,6 @@ mcp = FastMCP(
 # HTTP client helper
 # ---------------------------------------------------------------------------
 
-_client: httpx.Client | None = None
-
-
-def _get_client() -> httpx.Client:
-    """Return a shared HTTPX client, creating it on first use."""
-    global _client
-    if not settings.api_key:
-        raise ValueError(
-            "QONIC_API_KEY environment variable is not set. "
-            "Please provide a valid Qonic API key."
-        )
-    if _client is None:
-        _client = httpx.Client(
-            base_url=settings.base_url,
-            headers={
-                "Authorization": f"Bearer {settings.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            timeout=settings.timeout,
-        )
-    return _client
-
 
 def _api_request(
     method: str,
@@ -88,10 +67,25 @@ def _api_request(
     params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Make a request to the Qonic API and return parsed JSON."""
-    response = _get_client().request(method, path, params=params, json=body)
-    response.raise_for_status()
-    return response.json()
+    """Make a request to the Qonic API using the current user's OAuth token."""
+    token = _access_token.get()
+    if not token:
+        raise ValueError(
+            "Not authenticated. Connect through an MCP client to "
+            "authenticate with your Qonic account."
+        )
+    with httpx.Client(
+        base_url=BASE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        timeout=TIMEOUT,
+    ) as client:
+        response = client.request(method, path, params=params, json=body)
+        response.raise_for_status()
+        return response.json()
 
 
 # ---------------------------------------------------------------------------
@@ -279,12 +273,106 @@ def search(
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# OAuth Authorization Server Metadata (RFC 8414 / MCP auth spec)
+# ---------------------------------------------------------------------------
+
+async def _oauth_metadata(request: Request) -> JSONResponse:
+    """Return OAuth metadata so MCP clients know where to authenticate."""
+    base = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "")
+    if base and not base.startswith("http"):
+        base = f"https://{base}"
+    if not base:
+        base = str(request.base_url).rstrip("/")
+
+    metadata: dict[str, Any] = {
+        "issuer": base,
+        "authorization_endpoint": os.environ.get(
+            "QONIC_OAUTH_AUTHORIZE_URL",
+            f"{BASE_URL}/v1/auth/authorize",
+        ),
+        "token_endpoint": os.environ.get(
+            "QONIC_OAUTH_TOKEN_URL",
+            f"{BASE_URL}/v1/auth/token",
+        ),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        "scopes_supported": [
+            "projects:read", "projects:write",
+            "models:read", "models:write",
+            "issues:read",
+            "libraries:read", "libraries:write",
+        ],
+    }
+
+    if OAUTH_CLIENT_ID:
+        metadata["client_id"] = OAUTH_CLIENT_ID
+
+    return JSONResponse(metadata)
+
+
+# ---------------------------------------------------------------------------
+# Auth middleware – extract Bearer token for each request
+# ---------------------------------------------------------------------------
+
+class _AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            _access_token.set(auth[7:])
+        return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# ASGI application (Streamable HTTP transport for Vercel serverless)
+# ---------------------------------------------------------------------------
+
+_session_manager = StreamableHTTPSessionManager(
+    app=mcp._mcp_server,
+    stateless=True,
+)
+
+_http_handler = StreamableHTTPASGIApp(_session_manager)
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(app: Starlette) -> AsyncIterator[None]:
+    async with _session_manager.run():
+        yield
+
+
+app = Starlette(
+    routes=[
+        Route(
+            "/.well-known/oauth-authorization-server",
+            _oauth_metadata,
+        ),
+        Route("/mcp", endpoint=_http_handler, methods=["GET", "POST", "DELETE"]),
+    ],
+    middleware=[
+        Middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=["*"],
+        ),
+        Middleware(_AuthMiddleware),
+    ],
+    lifespan=_lifespan,
+)
+
+
+# ---------------------------------------------------------------------------
+# Entry point (local development)
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Start the Qonic MCP server using stdio transport (default for Smithery)."""
-    mcp.run(transport="stdio")
+    """Start the Qonic MCP server locally with uvicorn."""
+    import uvicorn
+
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":

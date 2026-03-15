@@ -1,5 +1,5 @@
 """Qonic MCP Server package."""
 
-from .server import main, mcp
+from .server import app, main
 
-__all__ = ["main", "mcp"]
+__all__ = ["app", "main"]
