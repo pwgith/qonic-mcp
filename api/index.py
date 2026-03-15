@@ -9,12 +9,13 @@ import contextvars
 import json
 import os
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, RedirectResponse, Response
 
 # ---------------------------------------------------------------------------
 # Per-request OAuth token (extracted from Authorization header)
@@ -31,6 +32,7 @@ _access_token: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 BASE_URL = os.environ.get("QONIC_BASE_URL", "https://api.qonic.com")
 TIMEOUT = int(os.environ.get("QONIC_TIMEOUT", "30"))
 OAUTH_CLIENT_ID = os.environ.get("QONIC_OAUTH_CLIENT_ID", "")
+OAUTH_CLIENT_SECRET = os.environ.get("QONIC_OAUTH_CLIENT_SECRET", "")
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -283,12 +285,13 @@ _inner_app = mcp.streamable_http_app()
 
 
 async def app(scope, receive, send):
-    """ASGI wrapper that adds OAuth metadata + token extraction."""
+    """ASGI wrapper that adds OAuth proxy endpoints + token extraction."""
     if scope["type"] == "http":
         request = Request(scope, receive, send)
+        path = request.url.path
 
-        # Serve OAuth metadata
-        if request.url.path == "/.well-known/oauth-authorization-server":
+        # --- OAuth metadata discovery ---
+        if path == "/.well-known/oauth-authorization-server":
             base = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "")
             if base and not base.startswith("http"):
                 base = f"https://{base}"
@@ -297,18 +300,13 @@ async def app(scope, receive, send):
 
             metadata: dict[str, Any] = {
                 "issuer": base,
-                "authorization_endpoint": os.environ.get(
-                    "QONIC_OAUTH_AUTHORIZE_URL",
-                    f"{BASE_URL}/v1/auth/authorize",
-                ),
-                "token_endpoint": os.environ.get(
-                    "QONIC_OAUTH_TOKEN_URL",
-                    f"{BASE_URL}/v1/auth/token",
-                ),
+                "authorization_endpoint": f"{base}/oauth/authorize",
+                "token_endpoint": f"{base}/oauth/token",
+                "registration_endpoint": f"{base}/oauth/register",
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code"],
                 "code_challenge_methods_supported": ["S256"],
-                "token_endpoint_auth_methods_supported": ["client_secret_post"],
+                "token_endpoint_auth_methods_supported": ["none"],
                 "scopes_supported": [
                     "projects:read", "projects:write",
                     "models:read", "models:write",
@@ -316,10 +314,62 @@ async def app(scope, receive, send):
                     "libraries:read", "libraries:write",
                 ],
             }
-            if OAUTH_CLIENT_ID:
-                metadata["client_id"] = OAUTH_CLIENT_ID
 
             response = JSONResponse(metadata)
+            await response(scope, receive, send)
+            return
+
+        # --- OAuth authorize proxy (redirect to Qonic) ---
+        if path == "/oauth/authorize":
+            params = dict(request.query_params)
+            params["client_id"] = OAUTH_CLIENT_ID
+            authorize_url = f"{BASE_URL}/v1/auth/authorize?{urlencode(params)}"
+            response = RedirectResponse(authorize_url, status_code=302)
+            await response(scope, receive, send)
+            return
+
+        # --- OAuth token proxy (inject client_secret) ---
+        if path == "/oauth/token" and request.method == "POST":
+            body = await request.body()
+            # Parse the form-encoded body from the MCP client
+            from urllib.parse import parse_qs
+            form_data = parse_qs(body.decode())
+            # Flatten single-value lists
+            token_params = {k: v[0] if len(v) == 1 else v for k, v in form_data.items()}
+            # Inject our client credentials
+            token_params["client_id"] = OAUTH_CLIENT_ID
+            token_params["client_secret"] = OAUTH_CLIENT_SECRET
+
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                token_resp = await client.post(
+                    f"{BASE_URL}/v1/auth/token",
+                    data=token_params,
+                )
+
+            response = Response(
+                content=token_resp.content,
+                status_code=token_resp.status_code,
+                headers={"Content-Type": token_resp.headers.get("content-type", "application/json")},
+            )
+            await response(scope, receive, send)
+            return
+
+        # --- Dynamic client registration (return our pre-registered client) ---
+        if path == "/oauth/register" and request.method == "POST":
+            base = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "")
+            if base and not base.startswith("http"):
+                base = f"https://{base}"
+            if not base:
+                base = str(request.base_url).rstrip("/")
+
+            response = JSONResponse({
+                "client_id": OAUTH_CLIENT_ID,
+                "client_name": "qonic-mcp",
+                "redirect_uris": [f"{base}/oauth/callback"],
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            })
             await response(scope, receive, send)
             return
 
