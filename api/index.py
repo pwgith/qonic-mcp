@@ -373,10 +373,21 @@ async def app(scope, receive, send):
             await response(scope, receive, send)
             return
 
-        # Extract Bearer token for API calls
+        # Extract Bearer token, or require auth on MCP endpoint
         auth = request.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
             _access_token.set(auth[7:])
+        elif path == "/mcp":
+            # Return 401 to trigger OAuth flow in MCP clients
+            response = Response(
+                content="Unauthorized",
+                status_code=401,
+                headers={
+                    "WWW-Authenticate": "Bearer",
+                },
+            )
+            await response(scope, receive, send)
+            return
 
     # Delegate everything else to the MCP app
     await _inner_app(scope, receive, send)
