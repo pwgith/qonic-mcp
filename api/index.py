@@ -44,7 +44,13 @@ mcp = FastMCP(
     instructions=(
         "This server exposes Qonic API capabilities through the Model Context Protocol. "
         "Use the available tools to interact with Qonic resources such as projects, "
-        "designs, analyses, and simulations."
+        "models, products (building elements), spatial locations, materials, types, "
+        "codifications, and custom properties.\n\n"
+        "Workflow for modifying a model:\n"
+        "1. Call start_modification_session before making changes\n"
+        "2. Use modify_products / delete_product to make changes\n"
+        "3. Call publish_changes to save, or discard_changes to revert\n"
+        "4. Call end_modification_session when done"
     ),
 )
 
@@ -59,8 +65,9 @@ def _api_request(
     path: str,
     *,
     params: dict[str, Any] | None = None,
-    body: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    body: Any | None = None,
+    allow_empty: bool = False,
+) -> Any:
     """Make a request to the Qonic API using the current user's OAuth token."""
     token = _access_token.get()
     if not token:
@@ -69,7 +76,7 @@ def _api_request(
             "authenticate with your Qonic account."
         )
     with httpx.Client(
-        base_url=BASE_URL,
+        base_url=BASE_URL + "/v1",
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -79,193 +86,520 @@ def _api_request(
     ) as client:
         response = client.request(method, path, params=params, json=body)
         response.raise_for_status()
+        if allow_empty and not response.content:
+            return {"status": "ok"}
         return response.json()
 
 
 # ---------------------------------------------------------------------------
-# Tools – Projects
+# Tools – Projects & Models
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
-def list_projects(
-    page: int = Field(default=1, description="Page number (1-based)"),
-    page_size: int = Field(default=20, description="Number of results per page (max 100)"),
+def list_projects() -> str:
+    """List all Qonic projects accessible to the authenticated user."""
+    result = _api_request("GET", "/projects")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def list_models(
+    project_id: str = Field(description="Project ID to list models for"),
 ) -> str:
-    """List all Qonic projects accessible with the configured API key."""
+    """List all models within a Qonic project. Returns model IDs, names, and edit permissions."""
+    result = _api_request("GET", f"/projects/{project_id}/models")
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tools – Products (building elements in a model)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_available_product_fields(
+    project_id: str = Field(description="Project ID"),
+    model_id: str = Field(description="Model ID"),
+) -> str:
+    """Get the list of available property fields for products in a model (e.g. Name, Class, FireRating, Width)."""
     result = _api_request(
-        "GET",
-        "/v1/projects",
-        params={"page": page, "page_size": min(page_size, 100)},
+        "GET", f"/projects/{project_id}/models/{model_id}/products/properties/available-data"
     )
     return json.dumps(result, indent=2)
 
 
 @mcp.tool()
-def get_project(
-    project_id: str = Field(description="The unique identifier of the project"),
-) -> str:
-    """Get details of a specific Qonic project by ID."""
-    result = _api_request("GET", f"/v1/projects/{project_id}")
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool()
-def create_project(
-    name: str = Field(description="Name of the new project"),
-    description: str = Field(default="", description="Optional project description"),
-) -> str:
-    """Create a new Qonic project."""
-    body: dict[str, Any] = {"name": name}
-    if description:
-        body["description"] = description
-    result = _api_request("POST", "/v1/projects", body=body)
-    return json.dumps(result, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Tools – Designs
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-def list_designs(
-    project_id: str = Field(description="Project ID to list designs for"),
-    page: int = Field(default=1, description="Page number (1-based)"),
-    page_size: int = Field(default=20, description="Number of results per page (max 100)"),
-) -> str:
-    """List all designs within a specific Qonic project."""
-    result = _api_request(
-        "GET",
-        f"/v1/projects/{project_id}/designs",
-        params={"page": page, "page_size": min(page_size, 100)},
-    )
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool()
-def get_design(
-    project_id: str = Field(description="Project ID that contains the design"),
-    design_id: str = Field(description="The unique identifier of the design"),
-) -> str:
-    """Get details of a specific design within a Qonic project."""
-    result = _api_request("GET", f"/v1/projects/{project_id}/designs/{design_id}")
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool()
-def create_design(
-    project_id: str = Field(description="Project ID in which to create the design"),
-    name: str = Field(description="Name of the new design"),
-    description: str = Field(default="", description="Optional design description"),
-) -> str:
-    """Create a new design within a Qonic project."""
-    body: dict[str, Any] = {"name": name}
-    if description:
-        body["description"] = description
-    result = _api_request("POST", f"/v1/projects/{project_id}/designs", body=body)
-    return json.dumps(result, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Tools – Analyses / Simulations
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-def list_analyses(
-    project_id: str = Field(description="Project ID to list analyses for"),
-    design_id: str = Field(description="Design ID to list analyses for"),
-) -> str:
-    """List all analyses associated with a specific design."""
-    result = _api_request(
-        "GET",
-        f"/v1/projects/{project_id}/designs/{design_id}/analyses",
-    )
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool()
-def run_analysis(
-    project_id: str = Field(description="Project ID that contains the design"),
-    design_id: str = Field(description="Design ID to run analysis on"),
-    analysis_type: str = Field(
-        description=(
-            "Type of analysis to run, e.g. 'structural', 'thermal', 'acoustic', "
-            "'electromagnetic', or 'fluid'"
-        )
+def query_products(
+    project_id: str = Field(description="Project ID"),
+    model_id: str = Field(description="Model ID"),
+    fields: str = Field(
+        description='JSON array of field names to return, e.g. ["Name", "Class", "Guid"]'
     ),
-    parameters: str = Field(
-        default="{}",
-        description="JSON string of analysis-specific parameters",
-    ),
-) -> str:
-    """Run an analysis on a Qonic design and return the job details."""
-    try:
-        params_dict = json.loads(parameters)
-    except json.JSONDecodeError as exc:
-        return json.dumps({"error": f"Invalid JSON in parameters: {exc}"})
-
-    body: dict[str, Any] = {
-        "analysis_type": analysis_type,
-        "parameters": params_dict,
-    }
-    result = _api_request(
-        "POST",
-        f"/v1/projects/{project_id}/designs/{design_id}/analyses",
-        body=body,
-    )
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool()
-def get_analysis_status(
-    project_id: str = Field(description="Project ID that contains the design"),
-    design_id: str = Field(description="Design ID the analysis belongs to"),
-    analysis_id: str = Field(description="Analysis job ID to check"),
-) -> str:
-    """Get the current status and results of a Qonic analysis job."""
-    result = _api_request(
-        "GET",
-        f"/v1/projects/{project_id}/designs/{design_id}/analyses/{analysis_id}",
-    )
-    return json.dumps(result, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Tools – Account / Utility
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-def get_account_info() -> str:
-    """Retrieve information about the authenticated Qonic account."""
-    result = _api_request("GET", "/v1/account")
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool()
-def search(
-    query: str = Field(description="Search query string"),
-    resource_type: str = Field(
-        default="all",
+    filters: str = Field(
+        default="[]",
         description=(
-            "Resource type to search within: 'projects', 'designs', 'analyses', or 'all'"
+            'JSON array of filter objects, e.g. [{"property": "Class", "value": "Wall", "operator": "equals"}]. '
+            "Use an empty array [] for no filtering."
         ),
     ),
-    page: int = Field(default=1, description="Page number (1-based)"),
-    page_size: int = Field(default=20, description="Number of results per page (max 100)"),
 ) -> str:
-    """Search Qonic resources by keyword."""
+    """Query products (building elements) in a model. Returns requested fields for all products matching the filters."""
+    fields_list = json.loads(fields)
+    filters_list = json.loads(filters)
     result = _api_request(
-        "GET",
-        "/v1/search",
-        params={
-            "q": query,
-            "type": resource_type,
-            "page": page,
-            "page_size": min(page_size, 100),
-        },
+        "POST",
+        f"/projects/{project_id}/models/{model_id}/products/properties/query",
+        body={"fields": fields_list, "filters": filters_list},
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def start_modification_session(
+    project_id: str = Field(description="Project ID"),
+    model_id: str = Field(description="Model ID to start a modification session on"),
+) -> str:
+    """Start a modification session on a model. Required before modifying or deleting products."""
+    result = _api_request(
+        "POST",
+        f"/projects/{project_id}/models/{model_id}/start-session",
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def end_modification_session(
+    project_id: str = Field(description="Project ID"),
+    model_id: str = Field(description="Model ID to end the modification session on"),
+) -> str:
+    """End the current modification session on a model."""
+    result = _api_request(
+        "POST",
+        f"/projects/{project_id}/models/{model_id}/end-session",
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def modify_products(
+    project_id: str = Field(description="Project ID"),
+    model_id: str = Field(description="Model ID"),
+    changes: str = Field(
+        description=(
+            "JSON object describing product property changes. Supports 'add', 'update', and 'delete' keys. "
+            'Example: {"update": {"FireRating": {"<product_guid>": {"PropertySet": "Pset_WallCommon", "Value": "60"}}}}'
+        ),
+    ),
+) -> str:
+    """Modify product properties in a model. Must call start_modification_session first."""
+    changes_dict = json.loads(changes)
+    result = _api_request(
+        "POST",
+        f"/projects/{project_id}/models/{model_id}/products",
+        body=changes_dict,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def delete_product(
+    project_id: str = Field(description="Project ID"),
+    model_id: str = Field(description="Model ID"),
+    product_guid: str = Field(description="GUID of the product to delete"),
+) -> str:
+    """Permanently delete a product (building element) from a model. Must call start_modification_session first."""
+    result = _api_request(
+        "DELETE",
+        f"/projects/{project_id}/models/{model_id}/products/{product_guid}",
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def publish_changes(
+    project_id: str = Field(description="Project ID"),
+    model_id: str = Field(description="Model ID"),
+    title: str = Field(default="", description="Title for the published version"),
+    description: str = Field(default="", description="Description of the changes"),
+) -> str:
+    """Publish pending changes in a modification session, creating a new model version."""
+    body: dict[str, Any] = {"title": title, "description": description}
+    result = _api_request(
+        "POST",
+        f"/projects/{project_id}/models/{model_id}/publish",
+        body=body,
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def discard_changes(
+    project_id: str = Field(description="Project ID"),
+    model_id: str = Field(description="Model ID"),
+) -> str:
+    """Discard all pending changes in the current modification session."""
+    result = _api_request(
+        "POST",
+        f"/projects/{project_id}/models/{model_id}/discard",
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tools – Spatial Locations
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_locations(
+    project_id: str = Field(description="Project ID"),
+) -> str:
+    """List all spatial locations (Sites, Buildings, Floors, Spaces) in a project."""
+    result = _api_request("GET", f"/projects/{project_id}/locations")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def create_location(
+    project_id: str = Field(description="Project ID"),
+    name: str = Field(description="Name of the location"),
+    location_type: str = Field(
+        description=(
+            "Type of location: Site, Building, Floor, Space, Bridge, MarineFacility, "
+            "Railway, Road, Facility, or ExternalSpatialElement"
+        ),
+    ),
+    parent_guid: str = Field(default="", description="GUID of the parent location (empty for top-level)"),
+) -> str:
+    """Create a new spatial location in a project's location hierarchy."""
+    body: dict[str, Any] = {"name": name, "type": location_type}
+    if parent_guid:
+        body["parentGuid"] = parent_guid
+    result = _api_request("POST", f"/projects/{project_id}/locations", body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def update_location(
+    project_id: str = Field(description="Project ID"),
+    location_guid: str = Field(description="GUID of the location to update"),
+    name: str = Field(default="", description="New name (leave empty to keep current)"),
+    location_type: str = Field(default="", description="New type (leave empty to keep current)"),
+    parent_guid: str = Field(default="", description="New parent GUID (leave empty to keep current)"),
+) -> str:
+    """Update a spatial location's properties."""
+    body: dict[str, Any] = {}
+    if name:
+        body["name"] = name
+    if location_type:
+        body["type"] = location_type
+    if parent_guid:
+        body["parentGuid"] = parent_guid
+    result = _api_request("PUT", f"/projects/{project_id}/locations/{location_guid}", body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def delete_location(
+    project_id: str = Field(description="Project ID"),
+    location_guid: str = Field(description="GUID of the location to delete"),
+) -> str:
+    """Permanently delete a spatial location from a project."""
+    result = _api_request(
+        "DELETE", f"/projects/{project_id}/locations/{location_guid}", allow_empty=True
+    )
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tools – Material Libraries
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_material_libraries(
+    project_id: str = Field(description="Project ID"),
+) -> str:
+    """List all material libraries in a project, including their materials."""
+    result = _api_request("GET", f"/projects/{project_id}/material-libraries")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_material_library(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the material library"),
+) -> str:
+    """Get details of a specific material library."""
+    result = _api_request("GET", f"/projects/{project_id}/material-libraries/{library_guid}")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def create_material_library(
+    project_id: str = Field(description="Project ID"),
+    name: str = Field(description="Name of the new material library"),
+    library_type: str = Field(default="project", description="'project' or 'model'"),
+    description: str = Field(default="", description="Optional description"),
+) -> str:
+    """Create a new material library in a project."""
+    body: dict[str, Any] = {"name": name, "type": library_type}
+    if description:
+        body["description"] = description
+    result = _api_request("POST", f"/projects/{project_id}/material-libraries", body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def create_material(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the material library"),
+    name: str = Field(description="Name of the material"),
+    color: str = Field(default="", description="Color value for the material"),
+    category: str = Field(default="", description="Material category"),
+    description: str = Field(default="", description="Optional description"),
+) -> str:
+    """Create a new material in a material library."""
+    body: dict[str, Any] = {"name": name}
+    if color:
+        body["color"] = color
+    if category:
+        body["category"] = category
+    if description:
+        body["description"] = description
+    result = _api_request(
+        "POST", f"/projects/{project_id}/material-libraries/{library_guid}/materials", body=body
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def update_material(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the material library"),
+    material_guid: str = Field(description="GUID of the material to update"),
+    name: str = Field(default="", description="New name"),
+    color: str = Field(default="", description="New color"),
+    category: str = Field(default="", description="New category"),
+    description: str = Field(default="", description="New description"),
+) -> str:
+    """Update a material's properties."""
+    body: dict[str, Any] = {}
+    if name:
+        body["name"] = name
+    if color:
+        body["color"] = color
+    if category:
+        body["category"] = category
+    if description:
+        body["description"] = description
+    result = _api_request(
+        "PUT",
+        f"/projects/{project_id}/material-libraries/{library_guid}/materials/{material_guid}",
+        body=body,
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def delete_material(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the material library"),
+    material_guid: str = Field(description="GUID of the material to delete"),
+) -> str:
+    """Permanently delete a material from a material library."""
+    result = _api_request(
+        "DELETE",
+        f"/projects/{project_id}/material-libraries/{library_guid}/materials/{material_guid}",
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tools – Types
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_types(
+    project_id: str = Field(description="Project ID"),
+) -> str:
+    """List all types (reusable element definitions like wall types, door types) in a project."""
+    result = _api_request("GET", f"/projects/{project_id}/types")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def create_type(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the type library to add the type to"),
+    name: str = Field(description="Name of the new type"),
+    type_class: str = Field(description="Class of the type (e.g. Wall, Door, Window, Slab)"),
+    subtype: str = Field(default="", description="Subtype of the type"),
+) -> str:
+    """Create a new type definition in a type library."""
+    body: dict[str, Any] = {"name": name, "class": type_class}
+    if subtype:
+        body["subtype"] = subtype
+    result = _api_request("POST", f"/projects/{project_id}/types/{library_guid}", body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def update_type(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the type library"),
+    type_guid: str = Field(description="GUID of the type to update"),
+    name: str = Field(default="", description="New name"),
+    type_class: str = Field(default="", description="New class"),
+    subtype: str = Field(default="", description="New subtype"),
+) -> str:
+    """Update a type definition's properties."""
+    body: dict[str, Any] = {}
+    if name:
+        body["name"] = name
+    if type_class:
+        body["class"] = type_class
+    if subtype:
+        body["subtype"] = subtype
+    result = _api_request(
+        "PUT",
+        f"/projects/{project_id}/types/{library_guid}/types/{type_guid}",
+        body=body,
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def delete_type(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the type library"),
+    type_guid: str = Field(description="GUID of the type to delete"),
+) -> str:
+    """Permanently delete a type definition from a type library."""
+    result = _api_request(
+        "DELETE",
+        f"/projects/{project_id}/types/{library_guid}/types/{type_guid}",
+        allow_empty=True,
+    )
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tools – Codification Libraries
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_codifications(
+    project_id: str = Field(description="Project ID"),
+) -> str:
+    """List all codification (classification) libraries in a project."""
+    result = _api_request("GET", f"/projects/{project_id}/codifications")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def create_codification_library(
+    project_id: str = Field(description="Project ID"),
+    name: str = Field(description="Name of the new codification library"),
+    library_type: str = Field(default="project", description="'project' or 'model'"),
+    description: str = Field(default="", description="Optional description"),
+) -> str:
+    """Create a new codification (classification) library in a project."""
+    body: dict[str, Any] = {"name": name, "type": library_type}
+    if description:
+        body["description"] = description
+    result = _api_request("POST", f"/projects/{project_id}/codifications", body=body)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def create_classification_code(
+    project_id: str = Field(description="Project ID"),
+    library_guid: str = Field(description="GUID of the codification library"),
+    name: str = Field(description="Name of the code"),
+    identification: str = Field(description="Identification string for the code"),
+    parent_id: str = Field(default="", description="Parent code ID (empty for top-level)"),
+    description: str = Field(default="", description="Optional description"),
+) -> str:
+    """Create a new classification code in a codification library."""
+    body: dict[str, Any] = {"name": name, "identification": identification}
+    if parent_id:
+        body["parentId"] = parent_id
+    if description:
+        body["description"] = description
+    result = _api_request(
+        "POST", f"/projects/{project_id}/codifications/{library_guid}/codification", body=body
+    )
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tools – Custom Properties
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_custom_properties(
+    project_id: str = Field(description="Project ID"),
+) -> str:
+    """List all custom property sets and their definitions in a project."""
+    result = _api_request("GET", f"/projects/{project_id}/customProperties")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def create_property_set(
+    project_id: str = Field(description="Project ID"),
+    name: str = Field(description="Name of the new property set"),
+    entity_types: str = Field(
+        default="[]",
+        description=(
+            'JSON array of entity type objects, e.g. '
+            '[{"displayName": "Wall", "value": "IfcWall", "predefinedTypes": []}]'
+        ),
+    ),
+) -> str:
+    """Create a new custom property set in a project."""
+    body: dict[str, Any] = {"name": name}
+    et = json.loads(entity_types)
+    if et:
+        body["entityTypes"] = et
+    result = _api_request(
+        "POST", f"/projects/{project_id}/customProperties/property-sets", body=body
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def add_property_definition(
+    project_id: str = Field(description="Project ID"),
+    property_set_id: str = Field(description="ID of the property set to add the property to"),
+    name: str = Field(description="Name of the property"),
+    data_type: str = Field(description="Data type (e.g. 'string', 'integer', 'boolean', 'real')"),
+    measure_type: str = Field(default="", description="Measure type"),
+    unit: str = Field(default="", description="Unit name"),
+) -> str:
+    """Add a new property definition to a custom property set."""
+    body: dict[str, Any] = {"name": name, "dataType": data_type}
+    if measure_type:
+        body["measureType"] = measure_type
+    if unit:
+        body["unit"] = unit
+    result = _api_request(
+        "POST",
+        f"/projects/{project_id}/customProperties/property-sets/{property_set_id}/property",
+        body=body,
     )
     return json.dumps(result, indent=2)
 
