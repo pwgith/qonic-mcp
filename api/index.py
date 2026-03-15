@@ -5,11 +5,12 @@ A Model Context Protocol server that exposes Qonic API capabilities as MCP tools
 Hosted on Vercel with OAuth authentication via Qonic.
 """
 
+import base64
 import contextvars
 import json
 import os
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qs, urlparse, urlunparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -321,24 +322,72 @@ async def app(scope, receive, send):
 
         # --- OAuth authorize proxy (redirect to Qonic) ---
         if path == "/oauth/authorize":
+            base = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "")
+            if base and not base.startswith("http"):
+                base = f"https://{base}"
+            if not base:
+                base = str(request.base_url).rstrip("/")
+
             params = dict(request.query_params)
             params["client_id"] = OAUTH_CLIENT_ID
+
+            # Wrap the original state + redirect_uri so we can relay
+            # the auth code back to mcp-remote's localhost callback.
+            original_redirect = params.pop("redirect_uri", "")
+            original_state = params.pop("state", "")
+            wrapped = json.dumps({"s": original_state, "r": original_redirect})
+            params["state"] = base64.urlsafe_b64encode(wrapped.encode()).decode()
+            params["redirect_uri"] = f"{base}/oauth/callback"
+
             authorize_url = f"{BASE_URL}/v1/auth/authorize?{urlencode(params)}"
             response = RedirectResponse(authorize_url, status_code=302)
+            await response(scope, receive, send)
+            return
+
+        # --- OAuth callback relay (Qonic -> our server -> mcp-remote localhost) ---
+        if path == "/oauth/callback":
+            params = dict(request.query_params)
+            wrapped_state = params.get("state", "")
+            try:
+                inner = json.loads(base64.urlsafe_b64decode(wrapped_state).decode())
+                original_redirect = inner["r"]
+                original_state = inner["s"]
+            except Exception:
+                response = Response("Invalid OAuth state", status_code=400)
+                await response(scope, receive, send)
+                return
+
+            # Build the redirect to mcp-remote's localhost callback
+            relay_params = {}
+            if "code" in params:
+                relay_params["code"] = params["code"]
+            if "error" in params:
+                relay_params["error"] = params["error"]
+            if original_state:
+                relay_params["state"] = original_state
+            relay_url = f"{original_redirect}?{urlencode(relay_params)}"
+            response = RedirectResponse(relay_url, status_code=302)
             await response(scope, receive, send)
             return
 
         # --- OAuth token proxy (inject client_secret) ---
         if path == "/oauth/token" and request.method == "POST":
             body = await request.body()
-            # Parse the form-encoded body from the MCP client
-            from urllib.parse import parse_qs
             form_data = parse_qs(body.decode())
             # Flatten single-value lists
             token_params = {k: v[0] if len(v) == 1 else v for k, v in form_data.items()}
             # Inject our client credentials
             token_params["client_id"] = OAUTH_CLIENT_ID
             token_params["client_secret"] = OAUTH_CLIENT_SECRET
+
+            # Replace mcp-remote's localhost redirect_uri with our Vercel
+            # callback URL — must match what was used in the authorize step.
+            base = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "")
+            if base and not base.startswith("http"):
+                base = f"https://{base}"
+            if not base:
+                base = str(request.base_url).rstrip("/")
+            token_params["redirect_uri"] = f"{base}/oauth/callback"
 
             async with httpx.AsyncClient(timeout=TIMEOUT) as client:
                 token_resp = await client.post(
@@ -356,16 +405,19 @@ async def app(scope, receive, send):
 
         # --- Dynamic client registration (return our pre-registered client) ---
         if path == "/oauth/register" and request.method == "POST":
-            base = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "")
-            if base and not base.startswith("http"):
-                base = f"https://{base}"
-            if not base:
-                base = str(request.base_url).rstrip("/")
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+
+            # Echo back the client's requested redirect_uris so mcp-remote
+            # can find its localhost callback URI in the cached registration.
+            client_redirect_uris = body.get("redirect_uris", [])
 
             response = JSONResponse({
                 "client_id": OAUTH_CLIENT_ID,
                 "client_name": "qonic-mcp",
-                "redirect_uris": [f"{base}/oauth/callback"],
+                "redirect_uris": client_redirect_uris,
                 "grant_types": ["authorization_code"],
                 "response_types": ["code"],
                 "token_endpoint_auth_method": "none",
